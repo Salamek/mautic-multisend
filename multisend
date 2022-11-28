@@ -83,7 +83,7 @@ class WorkerThread(Thread):
 
             env = {
                 'MAUTIC_CONFIG_PARAMETERS': json.dumps({
-                    'mautic.mailer_spool_path': str(self.spool_path.absolute())
+                    'mailer_spool_path': str(self.spool_path.absolute())
                 })
             }
 
