@@ -8,7 +8,7 @@ spool = pathlib.Path('./out_spool')
 
 config = json.loads(os.environ['MAUTIC_CONFIG_PARAMETERS'])
 
-mailer_spool_path = config.get('mautic.mailer_spool_path')
+mailer_spool_path = config.get('mailer_spool_path')
 if not mailer_spool_path:
     raise Exception('Spool path not found in env')
 
