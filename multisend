@@ -79,7 +79,7 @@ class WorkerThread(Thread):
             self.log.debug('%d messages found for worker %s is running...', number_of_messages, self.name)
 
             # We got here that means there are some messages to process!
-            command = [str(self.mautic_console_path.absolute()), 'mautic:emails:send']
+            command = [str(self.mautic_console_path.absolute()), 'mautic:emails:send', '--lock-name={}'.format(self.name)]
 
             env = {
                 'MAUTIC_CONFIG_PARAMETERS': json.dumps({
@@ -163,7 +163,7 @@ class MultiSend:
             self.spawn_worker(index)
 
     def spawn_worker(self, index: int):
-        self.log.debug('Spawning worker index %d', index)
+        self.log.debug('Checking worker index %d', index)
         worker = self.workers.get(index)
         is_alive = worker.is_alive() if worker else False
         if not is_alive:
