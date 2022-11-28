@@ -1,0 +1,233 @@
+#!/usr/bin/env python
+
+import configparser
+import subprocess
+import math
+import json
+import os
+import time
+import sys
+import logging
+from pathlib import Path
+from threading import Thread
+from typing import List, Iterator
+
+
+def check_pid(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    return True
+
+
+class WorkerThread(Thread):
+    def __init__(self, spools_path: Path, spool_path: Path, index: int, mautic_console_path: Path):
+        self.spools_path = spools_path
+        self.spool_path = spool_path
+        self.index = index
+        self.mautic_console_path = mautic_console_path
+        self.stopped = False
+        super().__init__(name='MauticMultiSendWorker-{}'.format(self.index))
+        self.log = logging.getLogger(self.name)
+
+    def get_lock_path(self) -> Path:
+        return self.spools_path.joinpath('spool_{}.lock'.format(self.index))
+
+    def check_lock(self) -> bool:
+        """
+        Returns False when pid in lockfile is taken else True
+        :return:
+        """
+        lock_path = self.get_lock_path()
+        if lock_path.is_file():
+            with open(lock_path, 'r') as f:
+                try:
+                    pid = int(f.read().strip())
+                    if check_pid(pid):
+                        return False
+                except ValueError:
+                    return False
+
+        return True
+
+    def create_lock(self, pid: int):
+        lock_path = self.get_lock_path()
+        with open(lock_path, 'w') as f:
+            f.write(str(pid))
+
+    def release_lock(self):
+        lock_path = self.get_lock_path()
+        lock_path.unlink()
+
+    def stop(self):
+        self.stopped = True
+
+    def run(self):
+        self.log.debug('Worker %s is starting to run...', self.name)
+        self.stopped = False
+        while not self.stopped and self.check_lock():
+            self.log.debug('Worker %s is running...', self.name)
+            # Check if there are messages to process
+            messages = list(self.spool_path.glob('*.message'))
+            number_of_messages = len(messages)
+            if number_of_messages == 0:
+                self.log.debug('No messages found for worker %s is running...', self.name)
+                break
+
+            self.log.debug('%d messages found for worker %s is running...', number_of_messages, self.name)
+
+            # We got here that means there are some messages to process!
+            command = [str(self.mautic_console_path.absolute()), 'mautic:emails:send']
+
+            env = {
+                'MAUTIC_CONFIG_PARAMETERS': json.dumps({
+                    'mautic.mailer_spool_path': str(self.spool_path.absolute())
+                })
+            }
+
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, env=env)
+            self.create_lock(process.pid)
+            process.wait()
+            self.release_lock()
+
+
+class MultiSend:
+    def __init__(self,
+                 threads: int = 5,
+                 spools_path: Path = Path('./multi-spools'),
+                 source_spool: Path = Path('spool'),
+                 spool_folder_format: str = 'spool_{}',
+                 mautic_console_path: Path = Path('./mautic/bin/console')
+                 ):
+        self.log = logging.getLogger()
+        self.threads = threads
+        self.spools_path = spools_path
+        self.source_spool = source_spool
+        self.spool_folder_format = spool_folder_format
+        self.mautic_console_path = mautic_console_path
+        self.workers = {}
+
+        if not self.source_spool.is_dir():
+            raise ValueError('source_spool {} does not exists'.format(self.source_spool.absolute()))
+
+        if not self.spools_path.is_dir():
+            raise ValueError('spools_path {} does not exists'.format(self.spools_path.absolute()))
+
+        if not self.mautic_console_path.is_file():
+            raise ValueError('mautic_console_path {} does not exists'.format(self.mautic_console_path.absolute()))
+
+        if not os.access(self.mautic_console_path, os.X_OK):
+            raise ValueError('mautic_console_path {} has no executable rights'.format(self.mautic_console_path.absolute()))
+
+        if '{}' not in self.spool_folder_format:
+            raise ValueError('spool_folder_format {} does not contain required {{}}'.format(self.spool_folder_format))
+
+        self.log.info('Using %s as source spool', self.source_spool.absolute())
+        self.log.info('Using %s as multiple spools path', self.spools_path.absolute())
+        self.log.info('Using %s as multiple spools dir name', self.spool_folder_format)
+
+    def chunk_messages(self, messages: List[Path], chunk_size: int) -> Iterator[List[Path]]:
+        """Yield successive n-sized chunks from lst."""
+        for i in range(0, len(messages), chunk_size):
+            yield messages[i:i + chunk_size]
+
+    def get_chunk_dir(self, chunk_index: int) -> Path:
+        return self.spools_path.joinpath(self.spool_folder_format.format(chunk_index))
+
+    def create_spools(self):
+        # we need to put our messages into buffer to "lock" our state
+        messages_buffer = list(self.source_spool.glob('*.message'))
+        messages_in_buffer = len(messages_buffer)
+        if messages_in_buffer == 0:
+            # No messages to process, nothing to do
+            self.log.debug('No new messages were found in source spool...')
+            return
+
+        self.log.info('%i messages were found in source spool...', messages_in_buffer)
+        chunk_size = math.ceil(messages_in_buffer / self.threads)
+        self.log.debug('Chunk size is %d', chunk_size)
+        for index, chunk in enumerate(self.chunk_messages(messages_buffer, chunk_size)):
+            chunk_dir = self.get_chunk_dir(index)
+            chunk_dir.mkdir(exist_ok=True)
+
+            for message in chunk:
+                message_chunk_path = chunk_dir.joinpath(message.name)
+                message.rename(message_chunk_path)
+            self.log.debug('All messages for chunk index %d were moved into %s', index, chunk_dir)
+            self.spawn_worker(index)
+
+    def spawn_workers(self):
+        for index in range(0, self.threads):
+            self.spawn_worker(index)
+
+    def spawn_worker(self, index: int):
+        self.log.debug('Spawning worker index %d', index)
+        worker = self.workers.get(index)
+        is_alive = worker.is_alive() if worker else False
+        if not is_alive:
+            if worker:
+                # Join dead worker
+                worker.join()
+            self.log.debug('Worker index %d not found, creating a new one', index)
+            chunk_dir = self.get_chunk_dir(index)
+            worker = WorkerThread(self.spools_path, chunk_dir, index, self.mautic_console_path)
+            worker.start()
+            self.workers[index] = worker
+
+    def execute_workers(self):
+        for worker in self.workers:
+            self.log.debug('Killing worker %s', worker.name)
+            worker.stop()
+
+
+if __name__ == '__main__':
+    log = logging.getLogger()
+    config = configparser.ConfigParser()
+    config.read('multisend.conf')
+
+    logging_file = config.get('LOGGING', 'FILE', fallback=None)
+    logging_level = config.get('LOGGING', 'LEVEL', fallback='INFO')
+
+    logging_handlers = [
+        logging.StreamHandler()
+    ]
+
+    if logging_file:
+        logging_handlers.append(logging.FileHandler(logging_file))
+
+    logging.basicConfig(
+        level=logging.getLevelName(logging_level.upper()),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=logging_handlers
+    )
+
+    multi_send = MultiSend(
+        threads=config.getint('EMAIL', 'THREADS', fallback=5),
+        spools_path=Path(config.get('EMAIL', 'SPOOLS_PATH')),
+        source_spool=Path(config.get('EMAIL', 'SOURCE_SPOOL')),
+        spool_folder_format=config.get('EMAIL', 'SPOOL_FOLDER_FORMAT'),
+        mautic_console_path=Path(config.get('EMAIL', 'MAUTIC_CONSOLE_PATH'))
+    )
+
+    try:
+        while True:
+            log.info('Spawning workers...')
+            multi_send.spawn_workers()
+
+            log.info('Creating spools')
+            multi_send.create_spools()
+            log.info('Waiting...')
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        log.info('Exiting!')
+        log.info('Killing of workers...')
+        multi_send.execute_workers()
+        log.info('Bye...')
+        sys.exit()
+
+
+
+
+
