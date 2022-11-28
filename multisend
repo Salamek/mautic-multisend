@@ -177,7 +177,7 @@ class MultiSend:
             self.workers[index] = worker
 
     def execute_workers(self):
-        for worker in self.workers:
+        for index, worker in self.workers.items():
             self.log.debug('Killing worker %s', worker.name)
             worker.stop()
 
