@@ -4,12 +4,13 @@ Requires=network.target
 
 [Service]
 Type=simple
+WorkingDirectory=/var/www/mautic-multisend
 User=www-data
 Group=www-data
 Restart=on-failure
 RemainAfterExit=no
 RestartSec=5s
-ExecStart=/path/to/multisend
+ExecStart=/var/www/mautic-multisend/multisend
 
 [Install]
 WantedBy=multi-user.target
